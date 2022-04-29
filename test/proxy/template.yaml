@@ -1,0 +1,62 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  proxy
+
+Globals:
+  Function:
+    Timeout: 3
+
+Resources:
+  Failure:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.failure
+      Runtime: nodejs14.x
+      Architectures:
+        - x86_64
+
+  ModHeader:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.modheader
+      Runtime: nodejs14.x
+      Architectures:
+        - x86_64
+  ModBody:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.modbody
+      Runtime: nodejs14.x
+      Architectures:
+        - x86_64
+  Respond:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.respond
+      Runtime: nodejs14.x
+      Architectures:
+        - x86_64
+  ModUri:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.moduri
+      Runtime: nodejs14.x
+      Architectures:
+        - x86_64
+
+
+  Success:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.success
+      Runtime: nodejs14.x
+      Architectures:
+        - x86_64
+
