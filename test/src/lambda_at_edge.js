@@ -9,13 +9,12 @@ exports.failure = async (event, context, callback) => {
 exports.modheader = async (event, context, callback) => {
   const request = event.Records[0].cf.request;
   const headers = request.headers;
-  console.log(JSON.stringify(headers))
   headers['X-Lambda-Handler'] = [{'value':'Header added by Lambda@Edge'}];
+  console.log(JSON.stringify(headers))
   callback(null, request);
 }
 exports.modbody = async (event, context, callback) => {
   const request = event.Records[0].cf.request;
-  console.log(JSON.stringify(request.body))
   if (request.method === 'POST') {
     const body = Buffer.from(request.body.data, 'base64').toString();
     const params = querystring.parse(body)
@@ -24,6 +23,7 @@ exports.modbody = async (event, context, callback) => {
     request.body.encoding = 'text';
     request.body.data = querystring.stringify(params);
   }
+  console.log(JSON.stringify(request.body))
   callback(null, request);
 }
 exports.respond = async (event, context, callback) => {
@@ -42,8 +42,8 @@ exports.respond = async (event, context, callback) => {
 }
 exports.moduri = async (event, context, callback) => {
   const request = event.Records[0].cf.request;
-  console.log(JSON.stringify(request.uri))
   request.uri = "/dev" + request.uri;
+  console.log(JSON.stringify(request.uri))
   callback(null, request)
 }
 

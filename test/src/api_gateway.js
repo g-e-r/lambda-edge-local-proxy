@@ -1,6 +1,6 @@
-let response;
+'use strict';
 
-exports.lambdaHandler = async (event, context) => {
+exports.proxy = async (event, context) => {
     console.log(JSON.stringify(event))
     const response = {
         'statusCode': 200,
