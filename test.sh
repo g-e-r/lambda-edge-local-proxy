@@ -24,8 +24,10 @@ curl -o tmp/Respond.txt -D tmp/Respond.headers.txt localhost:$PORT/Respond/
 curl -o tmp/ModUri.txt localhost:$PORT/ModUri/
 curl -o tmp/Success.txt localhost:$PORT/Success/
 
-for i in tmp/*; do echo ---$i--- ; cat $i ; echo ; done
+for i in tmp/*.txt; do echo ---$i--- ; cat $i ; echo ; done
 
 skill -TERM mitmdump
 skill -TERM sam
 
+# NOTE - if sam docker containers keep dangling, the following can be used to stop them.
+# docker container ps | grep public.ecr.aws/sam/emulation-nodejs14.x | cut -c 182- | xargs docker container stop
