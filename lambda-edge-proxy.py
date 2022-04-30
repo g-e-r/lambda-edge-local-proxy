@@ -100,32 +100,6 @@ class LambdaEdgeLocalProxy:
             help="Lambda@Edge CloudFormation Template",
         )
 
-    def add_funcs(self, path, funcs):
-        for func in funcs:
-            event_type = func["EventType"] if "EventType" in func else ""
-            include_body = func["IncludeBody"] if "IncludeBody" in func else False
-            func_arn = func["LambdaFunctionARN"] if "LambdaFunctionARN" in func else ""
-            if isinstance(func_arn, str):
-                func_name = func_arn.split(":")[6]
-            elif "Fn::GetAtt" in func_arn:
-                if func_arn["Fn::GetAtt"][1] == "FunctionArn":
-                    func_name = func_arn["Fn::GetAtt"][0]
-                else:
-                    ctx.log.error(
-                        "Lambda@Edge: LambdaFunctionARN unsupported Fn::GetAtt"
-                    )
-                    continue
-            else:
-                ctx.log.warn("Lambda@Edge: LambdaFunctionARN unsupported Fn::")
-                continue
-            if event_type == "viewer-request":
-                ctx.log.info(
-                    f"Lambda@Edge: viewer-request '{path}' route  to '{func_name}'"
-                )
-                self.funcs[event_type].append((path, func_name, include_body))
-            else:
-                ctx.log.warn(f"Lambda@Edge: EventType {event_type} not supported")
-
     def configure(self, updates: Set[str]):
         if "lambda_at_edge_endpoint" in updates:
             self.endpoint = ctx.options.lambda_at_edge_endpoint
@@ -182,6 +156,32 @@ class LambdaEdgeLocalProxy:
             if "LambdaFunctionAssociations" in behavior:
                 self.add_funcs("*", behavior["LambdaFunctionAssociations"])
 
+    def add_funcs(self, path, funcs):
+        for func in funcs:
+            event_type = func["EventType"] if "EventType" in func else ""
+            include_body = func["IncludeBody"] if "IncludeBody" in func else False
+            func_arn = func["LambdaFunctionARN"] if "LambdaFunctionARN" in func else ""
+            if isinstance(func_arn, str):
+                func_name = func_arn.split(":")[6]
+            elif "Fn::GetAtt" in func_arn:
+                if func_arn["Fn::GetAtt"][1] == "FunctionArn":
+                    func_name = func_arn["Fn::GetAtt"][0]
+                else:
+                    ctx.log.error(
+                        "Lambda@Edge: LambdaFunctionARN unsupported Fn::GetAtt"
+                    )
+                    continue
+            else:
+                ctx.log.warn("Lambda@Edge: LambdaFunctionARN unsupported Fn::")
+                continue
+            if event_type == "viewer-request":
+                ctx.log.info(
+                    f"Lambda@Edge: viewer-request '{path}' route  to '{func_name}'"
+                )
+                self.funcs[event_type].append((path, func_name, include_body))
+            else:
+                ctx.log.warn(f"Lambda@Edge: EventType {event_type} not supported")
+
     def get_client_ip(self, flow):
         return flow.client_conn.ip_address
 
@@ -195,23 +195,29 @@ class LambdaEdgeLocalProxy:
         return headers
 
     def set_headers(self, flow, payload):
-        # TODO must throw 502 if read-only headers are modifed
         headers = dict(
             get_header_kv_capitalized(x)
-            for x in payload["headers"].items()
-            if x[0].lower() not in READONLY_HEADERS_VIEWER_REQUESTS
-        )
+            for x in payload["headers"].items())
         for x in headers.keys():
             if x.lower() in FORBIDDEN_HEADERS:
+                ctx.log.warn(f"Lambda@Edge: modified forbidden header '{x}'")
                 flow.response = http.HTTPResponse.make(502)
                 return
         for x in headers.items():
             if x[0] not in flow.request.headers:
+                if x[0].lower() in READONLY_HEADERS_VIEWER_REQUESTS:
+                    ctx.log.warn(f"Lambda@Edge: added read-only header '{x[0]}'")
+                    flow.response = http.HTTPResponse.make(502)
+                    return
                 ctx.log.info(
                     f'Lambda@Edge: viewer-request added header: "{x[0]}": "{x[1]}"'
                 )
                 flow.request.headers[x[0]] = x[1]
             elif flow.request.headers[x[0]] != x[1]:
+                if x[0].lower() in READONLY_HEADERS_VIEWER_REQUESTS:
+                    ctx.log.warn(f"Lambda@Edge: modified read-only header '{x[0]}'")
+                    flow.response = http.HTTPResponse.make(502)
+                    return
                 ctx.log.info(
                     f'Lambda@Edge: viewer-request modified header to: "{x[0]}": "{x[1]}"'
                 )
@@ -251,7 +257,7 @@ class LambdaEdgeLocalProxy:
             elif body["encoding"] == "text":
                 new_body = bytes(body["data"], "utf-8")
             else:
-                ctx.log.error(payload)
+                ctx.log.warn(f"Lambda@Edge: unknown body encoding {body['encoding']}")
                 flow.response = http.HTTPResponse.make(502)
                 return
             flow.request.content = new_body
@@ -268,7 +274,7 @@ class LambdaEdgeLocalProxy:
     def set_uri(self, flow, payload):
         uri = payload["uri"]
         if uri[0] != "/":
-            ctx.log.error(payload)
+            ctx.log.warn(f"Lambda@Edge: URI must start with /")
             flow.response = http.HTTPResponse.make(502)
             return
         if payload["querystring"] != "":
@@ -288,11 +294,12 @@ class LambdaEdgeLocalProxy:
         # TODO not sure which headers are read-only in this situation
         headers = dict(get_header_kv_capitalized(x) for x in headers.items())
         for x in headers.keys():
-            if x in FORBIDDEN_HEADERS:
+            if x.lower() in FORBIDDEN_HEADERS:
+                ctx.log.warn(f"Lambda@Edge: adding forbidden header '{x}'")
                 flow.response = http.HTTPResponse.make(502)
                 return
         status_code = payload["status"]
-        ctx.log.info(f"Lambda@Edge: viewer-request directly responded: {status_code}")
+        ctx.log.info(f"Lambda@Edge: viewer-request directly responded: '{status_code}'")
         flow.response = http.HTTPResponse.make(
             status_code=status_code, content=content, headers=headers
         )
@@ -302,8 +309,7 @@ class LambdaEdgeLocalProxy:
     def find_func_from_path(self, uri, event_type):
         funcs = self.funcs[event_type]
         for (pattern, func_name, include_body) in funcs:
-            # We assume that AWS path pattern can be used as-is in fnmatch()
-            if fnmatch.fnmatch(uri, pattern):
+            if fnmatch.fnmatchcase(uri, pattern):
                 return (func_name, include_body)
         return (None, None)
 
@@ -341,13 +347,13 @@ class LambdaEdgeLocalProxy:
             if res["StatusCode"] != 200:
                 ctx.log.error("Lambda@Edge StatusCode: " + str(res["StatusCode"]))
                 flow.response = http.HTTPResponse.make(
-                    500, "Lambda@Edge StatusCode: " + str(res["StatusCode"])
+                    502, "Lambda@Edge StatusCode: " + str(res["StatusCode"])
                 )
                 return
+            payload = res["Payload"].read()
+            payload = json.loads(payload)
             if "FunctionError" in res:
-                ctx.log.error(res)
-                payload = res["Payload"].read()
-                payload = json.loads(payload)
+                ctx.log.warn(res)
                 flow.response = http.HTTPResponse.make(
                     502,
                     content="Lambda@Edge Error: "
@@ -357,16 +363,16 @@ class LambdaEdgeLocalProxy:
                     + "\n",
                 )
                 return
-            payload = res["Payload"].read()
-            payload = json.loads(payload)
             if "status" in payload:
                 # Do not connect to proxy, respond directly
                 self.set_response(flow, payload)
             else:
                 # Overwrite headers, URI and body
+                # NOTE - set_body() may change Content-Length
+                # So, set_headers() must be called before that.
+                self.set_headers(flow, payload)
                 self.set_body(flow, payload)
                 self.set_uri(flow, payload)
-                self.set_headers(flow, payload)
         except (ReadTimeoutError, ClientError, ConnectionRefusedError, EndpointConnectionError) as e:
             ctx.log.warn(e)
             flow.response = http.HTTPResponse.make(
