@@ -67,6 +67,7 @@ Resources:
           - PathPattern: /ModBody/*
             LambdaFunctionAssociations:
               - EventType: viewer-request
+                IncludeBody: true
                 LambdaFunctionARN: !GetAtt ModBodyFunction.FunctionArn
           - PathPattern: /Respond/*
             LambdaFunctionAssociations:

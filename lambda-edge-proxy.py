@@ -53,6 +53,10 @@ READONLY_HEADERS_VIEWER_REQUESTS = [
     "via",
 ]
 
+def get_header_kv_capitalized(x):
+    key = "-".join(w.capitalize() for w in x[0].split("-"))
+    return (x[1][0]["key"] if "key" in x[1][0] else key, x[1][0]["value"])
+
 
 class LambdaEdgeLocalProxy:
     def __init__(self):
@@ -169,13 +173,9 @@ class LambdaEdgeLocalProxy:
         return headers
 
     def set_headers(self, flow, payload):
-        # TODO fix Camel-Case of x[0]
-        def get_header_pair(x):
-            return (x[1][0]["key"] if "key" in x[1][0] else x[0], x[1][0]["value"])
-
         # TODO must throw 502 if read-only headers are modifed
         headers = dict(
-            get_header_pair(x)
+            get_header_kv_capitalized(x)
             for x in payload["headers"].items()
             if x[0].lower() not in READONLY_HEADERS_VIEWER_REQUESTS
         )
@@ -225,12 +225,14 @@ class LambdaEdgeLocalProxy:
         if action == "replace":
             ctx.log.info("Lambda@Edge: viewer-request replaced body")
             if body["encoding"] == "base64":
-                new_body = str(base64.b64decode(body["data"]), "utf-8")
+                new_body = base64.b64decode(body["data"])
             elif body["encoding"] == "text":
-                new_body = body["data"]
+                new_body = bytes(body["data"], "utf-8")
             else:
                 ctx.log.error(payload)
                 flow.response = http.HTTPResponse.make(502)
+                return
+            flow.request.content = new_body
 
     def get_uri(self, flow):
         return flow.request.path.split("?")[0]
@@ -261,12 +263,8 @@ class LambdaEdgeLocalProxy:
         if encoding == "base64":
             content = str(base64.b64decode(content), "utf-8")
         headers = payload["headers"] if "headers" in payload else {}
-        # TODO fix Camel-Case of x[0]
-        def get_header_pair(x):
-            return (x[1][0]["key"] if "key" in x[1][0] else x[0], x[1][0]["value"])
-
         # TODO not sure which headers are read-only in this situation
-        headers = dict(get_header_pair(x) for x in headers.items())
+        headers = dict(get_header_kv_capitalized(x) for x in headers.items())
         for x in headers.keys():
             if x in FORBIDDEN_HEADERS:
                 flow.response = http.HTTPResponse.make(502)
@@ -276,6 +274,8 @@ class LambdaEdgeLocalProxy:
         flow.response = http.HTTPResponse.make(
             status_code=status_code, content=content, headers=headers
         )
+        if "statusDescription" in payload:
+            flow.response.reason = payload["statusDescription"]
 
     def find_func_from_path(self, uri, event_type):
         funcs = self.funcs[event_type]
