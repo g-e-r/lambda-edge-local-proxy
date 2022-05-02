@@ -24,21 +24,20 @@ SOFTWARE.
 Emulate Lambda@Edge Viewer Request events.
 S3 and Custom Origin specific parameters not supported.
 """
-from mitmproxy import ctx, http
-import mitmproxy as mitm
-from collections.abc import Set
-import boto3
-from botocore.config import Config
-from botocore import UNSIGNED
-from botocore.exceptions import ReadTimeoutError, ClientError, EndpointConnectionError
-import json
-import typing
-import traceback
 import base64
+import fnmatch
+import json
+import traceback
+import typing
 from collections import defaultdict
+from collections.abc import Set
+
+import boto3
+import botocore
+import mitmproxy as mitm
 import yaml
 from cfn_tools import load_yaml
-import fnmatch
+from mitmproxy import ctx, http
 
 FORBIDDEN_HEADERS = [
     "connection",
@@ -75,9 +74,15 @@ READONLY_HEADERS_VIEWER_REQUESTS = [
     "via",
 ]
 
+
 def get_header_kv_capitalized(x):
     key = "-".join(w.capitalize() for w in x[0].split("-"))
-    return (x[1][0]["key"] if "key" in x[1][0] else key, x[1][0]["value"])
+    val = (
+        x[1][0]["value"]
+        if isinstance(x[1], list) and isinstance(x[1][0], dict) and "value" in x[1][0]
+        else ""
+    )
+    return (x[1][0]["key"] if "key" in x[1][0] else key, val)
 
 
 class LambdaEdgeLocalProxy:
@@ -87,6 +92,9 @@ class LambdaEdgeLocalProxy:
         self.funcs = defaultdict(list)
 
     def load(self, loader: mitm.addonmanager.Loader):
+        """Add loader options to mitmproxy.
+        This function is a mitmproxy hook.
+        """
         loader.add_option(
             name="lambda_at_edge_endpoint",
             typespec=str,
@@ -101,6 +109,9 @@ class LambdaEdgeLocalProxy:
         )
 
     def configure(self, updates: Set[str]):
+        """Configure from mitmproxy options.
+        This function is a mitmproxy hook.
+        """
         if "lambda_at_edge_endpoint" in updates:
             self.endpoint = ctx.options.lambda_at_edge_endpoint
             try:
@@ -109,39 +120,44 @@ class LambdaEdgeLocalProxy:
                     endpoint_url=ctx.options.lambda_at_edge_endpoint,
                     use_ssl=False,
                     verify=False,
-                    config=Config(
-                        signature_version=UNSIGNED,
+                    config=botocore.config.Config(
+                        signature_version=botocore.UNSIGNED,
                         read_timeout=15,
                         retries={"max_attempts": 0},
                     ),
                 )
             except Exception as e:
                 ctx.log.error(e)
+                traceback.print_exc(e)
         if "lambda_at_edge_cf_template" in updates:
             try:
                 text = open(ctx.options.lambda_at_edge_cf_template, "r").read()
                 data = load_yaml(text)
-                found = False
+                found = None
                 self.funcs = defaultdict(list)
-                for k, v in data["Resources"].items():
+                resources = data["Resources"]
+                for k, v in resources.items():
                     if v["Type"] == "AWS::CloudFront::Distribution":
                         if found:
                             ctx.log.warn(
-                                "Lambda@Edge: only first CloudFront Distribution "
-                                + "is used in the template file"
+                                f"Lambda@Edge: only first CloudFront Distribution '{found}'"
+                                + " used from the template file"
                             )
                             return
-                        found = True
+                        found = k
                         dist_config = v["Properties"]["DistributionConfig"]
-                        self.populate_from_dist_config(dist_config)
+                        self.populate_from_dist_config(resources, dist_config)
                 if len(self.funcs) == 0:
                     ctx.log.error(
-                        "Lambda@Edge: Could not find any LambdaFunctionAssociations"
+                        "Lambda@Edge: Could not find any "
+                        + "LambdaFunctionAssociations in '{found}'"
                     )
             except Exception as e:
                 ctx.log.error(e)
+                traceback.print_exc(e)
 
-    def populate_from_dist_config(self, dist_config):
+    def populate_from_dist_config(self, resources, dist_config):
+        """populate from CloudFront DistributionConfig"""
         if "CacheBehaviors" in dist_config:
             behaviors = dist_config["CacheBehaviors"]
             for behavior in behaviors:
@@ -150,19 +166,40 @@ class LambdaEdgeLocalProxy:
                     ctx.log.warn("Lambda@Edge: path functions not supported")
                     continue
                 if "LambdaFunctionAssociations" in behavior:
-                    self.add_funcs(path, behavior["LambdaFunctionAssociations"])
+                    self.add_funcs(
+                        resources, path, behavior["LambdaFunctionAssociations"]
+                    )
         if "DefaultCacheBehavior" in dist_config:
             behavior = dist_config["DefaultCacheBehavior"]
             if "LambdaFunctionAssociations" in behavior:
-                self.add_funcs("*", behavior["LambdaFunctionAssociations"])
+                self.add_funcs(resources, "*", behavior["LambdaFunctionAssociations"])
 
-    def add_funcs(self, path, funcs):
+    def resolve_ref(self, res, ref):
+        if "Ref" in ref:
+            ref_name = ref["Ref"]
+            if ref_name in res:
+                return ref_name
+            else:
+                ctx.log.error(f"Cannot resolve reference {ref} {ref_name}")
+        return None
+
+    def add_funcs(self, res, path, funcs):
+        """Add template.yaml functions to self.funcs"""
         for func in funcs:
             event_type = func["EventType"] if "EventType" in func else ""
             include_body = func["IncludeBody"] if "IncludeBody" in func else False
             func_arn = func["LambdaFunctionARN"] if "LambdaFunctionARN" in func else ""
             if isinstance(func_arn, str):
                 func_name = func_arn.split(":")[6]
+            elif "Ref" in func_arn:
+                func_version = res[self.resolve_ref(res, func_arn)]
+                if func_version["Type"] != "AWS::Lambda::Version":
+                    ctx.log.error(f"Lambda@Edge: not a Lambda Version reference")
+                    continue
+                props = (
+                    func_version["Properties"] if "Properties" in func_version else {}
+                )
+                func_name = self.resolve_ref(res, props["FunctionName"])
             elif "Fn::GetAtt" in func_arn:
                 if func_arn["Fn::GetAtt"][1] == "FunctionArn":
                     func_name = func_arn["Fn::GetAtt"][0]
@@ -172,20 +209,26 @@ class LambdaEdgeLocalProxy:
                     )
                     continue
             else:
-                ctx.log.warn("Lambda@Edge: LambdaFunctionARN unsupported Fn::")
+                ctx.log.warn("Lambda@Edge: LambdaFunctionARN unsupported syntax")
                 continue
             if event_type == "viewer-request":
                 ctx.log.info(
-                    f"Lambda@Edge: viewer-request '{path}' route  to '{func_name}'"
+                    f"Lambda@Edge: viewer-request '{path}' route to '{func_name}'"
                 )
-                self.funcs[event_type].append((path, func_name, include_body))
+            elif event_type == "origin-request":
+                ctx.log.info(
+                    f"Lambda@Edge: origin-request '{path}' route to '{func_name}'"
+                )
             else:
-                ctx.log.warn(f"Lambda@Edge: EventType {event_type} not supported")
+                ctx.log.warn(f"Lambda@Edge: EventType '{event_type}' not supported")
+            self.funcs[event_type].append((path, func_name, include_body))
 
     def get_client_ip(self, flow):
+        """Retrieve client ip from mitmproxy flow"""
         return flow.client_conn.ip_address
 
     def get_headers(self, flow):
+        """Tranlate mitmproxy headers to lambda@edge headers"""
         items = flow.request.headers.items()
         headers = dict(
             (x[0].lower(), [{"key": x[0], "value": x[1]}])
@@ -195,38 +238,45 @@ class LambdaEdgeLocalProxy:
         return headers
 
     def set_headers(self, flow, payload):
-        headers = dict(
-            get_header_kv_capitalized(x)
-            for x in payload["headers"].items())
+        """Translate lambda@edge headers to mitmproxy headers"""
+        if not "headers" in payload:
+            return
+        headers = dict(get_header_kv_capitalized(x) for x in payload["headers"].items())
         for x in headers.keys():
             if x.lower() in FORBIDDEN_HEADERS:
-                ctx.log.warn(f"Lambda@Edge: modified forbidden header '{x}'")
-                flow.response = http.HTTPResponse.make(502)
+                msg = f"Lambda@Edge: included forbidden header '{x}' in response"
+                ctx.log.warn(msg)
+                flow.response = http.HTTPResponse.make(502, msg)
                 return
         for x in headers.items():
             if x[0] not in flow.request.headers:
                 if x[0].lower() in READONLY_HEADERS_VIEWER_REQUESTS:
-                    ctx.log.warn(f"Lambda@Edge: added read-only header '{x[0]}'")
-                    flow.response = http.HTTPResponse.make(502)
+                    msg = f"Lambda@Edge: added read-only header '{x[0]}'"
+                    ctx.log.warn(msg)
+                    flow.response = http.HTTPResponse.make(502, msg)
                     return
-                ctx.log.info(
-                    f'Lambda@Edge: viewer-request added header: "{x[0]}": "{x[1]}"'
-                )
+                ctx.log.info(f"Lambda@Edge: *-request added header: '{x[0]}': '{x[1]}'")
                 flow.request.headers[x[0]] = x[1]
             elif flow.request.headers[x[0]] != x[1]:
                 if x[0].lower() in READONLY_HEADERS_VIEWER_REQUESTS:
-                    ctx.log.warn(f"Lambda@Edge: modified read-only header '{x[0]}'")
-                    flow.response = http.HTTPResponse.make(502)
+                    msg = (
+                        f"Lambda@Edge: modified read-only header '{x[0]}' "
+                        + "from '{flow.request.headers[x[0]]}' to '{x[1]}'"
+                    )
+                    ctx.log.warn(msg)
+                    flow.response = http.HTTPResponse.make(502, msg)
                     return
                 ctx.log.info(
-                    f'Lambda@Edge: viewer-request modified header to: "{x[0]}": "{x[1]}"'
+                    f"Lambda@Edge: *-request modified header to: '{x[0]}': '{x[1]}'"
                 )
                 flow.request.headers[x[0]] = x[1]
 
     def get_method(self, flow):
+        """Get HTTP method from mitmproxy"""
         return flow.request.method
 
     def get_body(self, flow, include_body):
+        """Translate mitmproxy body to lambda@edge body"""
         if not include_body:
             # TODO - not sure what to include if there is no body
             return {
@@ -244,6 +294,7 @@ class LambdaEdgeLocalProxy:
             }
 
     def set_body(self, flow, payload):
+        """Translate lambda@edge body to mitmproxy body"""
         if "body" not in payload:
             return
         body = payload["body"]
@@ -251,39 +302,47 @@ class LambdaEdgeLocalProxy:
             return
         action = body["action"]
         if action == "replace":
-            ctx.log.info("Lambda@Edge: viewer-request replaced body")
             if body["encoding"] == "base64":
+                ctx.log.info("Lambda@Edge: *-request replaced body using base64")
                 new_body = base64.b64decode(body["data"])
             elif body["encoding"] == "text":
+                ctx.log.info("Lambda@Edge: *-request replaced body using text")
                 new_body = bytes(body["data"], "utf-8")
             else:
-                ctx.log.warn(f"Lambda@Edge: unknown body encoding {body['encoding']}")
-                flow.response = http.HTTPResponse.make(502)
+                msg = f"Lambda@Edge: unknown body encoding '{body['encoding']}'"
+                ctx.log.warn(msg)
+                flow.response = http.HTTPResponse.make(502, msg)
                 return
             flow.request.content = new_body
 
     def get_uri(self, flow):
+        """Get URI from mitmproxy"""
         return flow.request.path.split("?")[0]
 
     def get_querystring(self, flow):
+        """Get querystring from mitmproxy"""
         path = flow.request.path
         if "?" not in path:
             return ""
         return path[path.find("?") + 1 :]
 
     def set_uri(self, flow, payload):
-        uri = payload["uri"]
+        """Set URI from lambda@edge to mitmproxy"""
+        uri = payload["uri"] if "uri" in payload else "/"
+        querystring = payload["querystring"] if "querystring" in payload else ""
         if uri[0] != "/":
-            ctx.log.warn(f"Lambda@Edge: URI must start with /")
-            flow.response = http.HTTPResponse.make(502)
+            msg = f"Lambda@Edge: URI must start with /"
+            ctx.log.warn(msg)
+            flow.response = http.HTTPResponse.make(502, msg)
             return
-        if payload["querystring"] != "":
-            uri += "?" + payload["querystring"]
+        if querystring != "":
+            uri += "?" + querystring
         if flow.request.path != uri:
-            ctx.log.info(f"Lambda@Edge: viewer-request replaced URI to '{uri}'")
+            ctx.log.info(f"Lambda@Edge: *-request replaced URI to '{uri}'")
             flow.request.path = uri
 
     def set_response(self, flow, payload):
+        """Set mitmproxy response from lambda@edge, if needed"""
         if "status" not in payload:
             return
         content = payload["body"] if "body" in payload else ""
@@ -295,18 +354,20 @@ class LambdaEdgeLocalProxy:
         headers = dict(get_header_kv_capitalized(x) for x in headers.items())
         for x in headers.keys():
             if x.lower() in FORBIDDEN_HEADERS:
-                ctx.log.warn(f"Lambda@Edge: adding forbidden header '{x}'")
-                flow.response = http.HTTPResponse.make(502)
+                msg = f"Lambda@Edge: adding forbidden header '{x}'"
+                ctx.log.warn(msg)
+                flow.response = http.HTTPResponse.make(502, msg)
                 return
         status_code = payload["status"]
-        ctx.log.info(f"Lambda@Edge: viewer-request directly responded: '{status_code}'")
-        flow.response = http.HTTPResponse.make(
-            status_code=status_code, content=content, headers=headers
-        )
+        ctx.log.info(f"Lambda@Edge: *-request directly responded: '{status_code}'")
+        flow.response = http.HTTPResponse.make(status_code, content, headers)
         if "statusDescription" in payload:
             flow.response.reason = payload["statusDescription"]
 
-    def find_func_from_path(self, uri, event_type):
+    def find_func_from_path(self, uri, event_type) -> (str, bool):
+        """Find lambda@edge function from URI.
+        Returns: (function name, include body)
+        """
         funcs = self.funcs[event_type]
         for (pattern, func_name, include_body) in funcs:
             if fnmatch.fnmatchcase(uri, pattern):
@@ -314,8 +375,25 @@ class LambdaEdgeLocalProxy:
         return (None, None)
 
     def request(self, flow: http.HTTPFlow):
+        """Process a request from mitmproxy.
+        This function is a mitmproxy hook.
+        """
         uri = self.get_uri(flow)
-        (func_name, include_body) = self.find_func_from_path(uri, "viewer-request")
+        self.request_to_lambda(flow, uri, "viewer-request")
+        if flow.response:
+            return
+        self.request_to_lambda(flow, uri, "origin-request")
+
+    def response(self, flow: http.HTTPFlow):
+        """Process a response from mitmproxy.
+        This function is a mitmproxy hook.
+        Not yet implemented - we need to keep the original uri
+        in the flow structure to find the appropriate functions.
+        """
+        pass
+
+    def request_to_lambda(self, flow: http.HTTPFlow, uri, event_type):
+        (func_name, include_body) = self.find_func_from_path(uri, event_type)
         if func_name == None:
             return
         req = json.dumps(
@@ -326,16 +404,16 @@ class LambdaEdgeLocalProxy:
                             "config": {
                                 "distributionDomainName": "dummy.cloudfront.net",
                                 "distributionId": "DUMMYIDEXAMPLE",
-                                "eventType": "viewer-request",
+                                "eventType": event_type,
                                 "requestId": "IsThisReallyNeeded",
                             },
                             "request": {
-                                "clientIp": self.get_client_ip(flow),  # RO
-                                "headers": self.get_headers(flow),  # RW
-                                "method": self.get_method(flow),  # RO
-                                "querystring": self.get_querystring(flow),  # RW
-                                "uri": self.get_uri(flow),  # RW
-                                "body": self.get_body(flow, include_body),  # RW
+                                "clientIp": self.get_client_ip(flow),
+                                "headers": self.get_headers(flow),
+                                "method": self.get_method(flow),
+                                "querystring": self.get_querystring(flow),
+                                "uri": self.get_uri(flow),
+                                "body": self.get_body(flow, include_body),
                             },
                         }
                     }
@@ -345,23 +423,31 @@ class LambdaEdgeLocalProxy:
         try:
             res = self.lambda_client.invoke(FunctionName=func_name, Payload=req)
             if res["StatusCode"] != 200:
-                ctx.log.error("Lambda@Edge StatusCode: " + str(res["StatusCode"]))
-                flow.response = http.HTTPResponse.make(
-                    502, "Lambda@Edge StatusCode: " + str(res["StatusCode"])
-                )
+                msg = "Lambda@Edge StatusCode: " + str(res["StatusCode"])
+                ctx.log.error(msg)
+                flow.response = http.HTTPResponse.make(502, msg)
                 return
-            payload = res["Payload"].read()
-            payload = json.loads(payload)
+            payload_raw = res["Payload"].read()
+            if not payload_raw:
+                msg = f"Lambda@Edge: no payload"
+                ctx.log.warn(msg)
+                flow.response = http.HTTPResponse.make(502, msg)
+                return
+            try:
+                payload = json.loads(payload_raw)
+            except json.decoder.JSONDecodeError as e:
+                # If payload_raw starts with b'Task timed out after
+                # then it's a timeout error - error 503
+                msg = f"Lambda@Edge non-JSON payload: '{payload_raw}'"
+                ctx.log.warn(msg)
+                flow.response = http.HTTPResponse.make(503, msg)
+                return
             if "FunctionError" in res:
-                ctx.log.warn(res)
-                flow.response = http.HTTPResponse.make(
-                    502,
-                    content="Lambda@Edge Error: "
-                    + res["FunctionError"]
-                    + "\n"
-                    + str(payload)
-                    + "\n",
+                msg = (
+                    f"Lambda@Edge FunctionError: '{res['FunctionError']}'\n'{payload}'"
                 )
+                ctx.log.warn(msg)
+                flow.response = http.HTTPResponse.make(502, msg)
                 return
             if "status" in payload:
                 # Do not connect to proxy, respond directly
@@ -369,25 +455,26 @@ class LambdaEdgeLocalProxy:
             else:
                 # Overwrite headers, URI and body
                 # NOTE - set_body() may change Content-Length
-                # So, set_headers() must be called before that.
+                # So, set_headers() must be called before set_body().
                 self.set_headers(flow, payload)
                 self.set_body(flow, payload)
                 self.set_uri(flow, payload)
-        except (ReadTimeoutError, ClientError, ConnectionRefusedError, EndpointConnectionError) as e:
-            ctx.log.warn(e)
-            flow.response = http.HTTPResponse.make(
-                status_code=502,
-                content="Exception: " + repr(e),
-                headers={"Content-Type": "text/plain"},
-            )
+        except (
+            botocore.exceptions.ReadTimeoutError,
+            botocore.exceptions.ClientError,
+            ConnectionRefusedError,
+            botocore.exceptions.EndpointConnectionError,
+        ) as e:
+            msg = f"Lambda@Edge: Exception: {repr(e)}"
+            ctx.log.warn(msg)
+            if isinstance(e, json.decoder.JSONDecodeError):
+                ctx.log.warn(payload)
+            flow.response = http.HTTPResponse.make(502, msg)
         except Exception as e:
-            ctx.log.error(e)
+            msg = f"Lambda@Edge: Exception: {repr(e)}"
+            ctx.log.error(msg)
             traceback.print_exc(e)
-            flow.response = http.HTTPResponse.make(
-                status_code=502,
-                content="Exception: " + repr(e),
-                headers={"Content-Type": "text/plain"},
-            )
+            flow.response = http.HTTPResponse.make(502, msg)
 
 
 addons = [LambdaEdgeLocalProxy()]

@@ -5,7 +5,7 @@ exports.proxy = async (event, context) => {
   const response = {
     statusCode: 200,
     body: JSON.stringify({
-      header: event.headers["X-Lambda-Handler"],
+      header: "X-Key = '" + event.headers["X-Key"] + "'",
       body: event.body,
       path: event.path,
       message: "Served by API Gateway Proxy",

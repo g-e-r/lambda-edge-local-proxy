@@ -1,55 +1,124 @@
 AWSTemplateFormatVersion: "2010-09-09"
-# Transform: AWS::Serverless-2016-10-31
+Transform: AWS::Serverless-2016-10-31
 
 Globals:
   Function:
     Runtime: nodejs14.x
-    Timeout: 10
+    Timeout: 5
 
 Resources:
   FailureFunction:
     Type: AWS::Serverless::Function
     Properties:
       Handler: src/lambda_at_edge.failure
+      CodeUri: ./
+      Role: !GetAtt LambdaEdgeExecutionRole.Arn
+  FailureFunctionV:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref FailureFunction
 
   ModHeaderFunction:
     Type: AWS::Serverless::Function
     Properties:
       Handler: src/lambda_at_edge.modheader
+      CodeUri: ./
+      Role: !GetAtt LambdaEdgeExecutionRole.Arn
+  ModHeaderFunctionV:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref  ModHeaderFunction
 
   ModBodyFunction:
     Type: AWS::Serverless::Function
     Properties:
       Handler: src/lambda_at_edge.modbody
+      CodeUri: ./
+      Role: !GetAtt LambdaEdgeExecutionRole.Arn
+  ModBodyFunctionV:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref ModBodyFunction
 
   RespondFunction:
     Type: AWS::Serverless::Function
     Properties:
       Handler: src/lambda_at_edge.respond
+      CodeUri: ./
+      Role: !GetAtt LambdaEdgeExecutionRole.Arn
+  RespondFunctionV:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref RespondFunction
 
   ModUriFunction:
     Type: AWS::Serverless::Function
     Properties:
       Handler: src/lambda_at_edge.moduri
+      CodeUri: ./
+      Role: !GetAtt LambdaEdgeExecutionRole.Arn
+  ModUriFunctionV:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref ModUriFunction
 
   SuccessFunction:
     Type: AWS::Serverless::Function
     Properties:
       Handler: src/lambda_at_edge.success
+      CodeUri: ./
+      Role: !GetAtt LambdaEdgeExecutionRole.Arn
+  SuccessFunctionV:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref SuccessFunction
+
+  SuccessResponseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/lambda_at_edge.success_response
+      CodeUri: ./
+      Role: !GetAtt LambdaEdgeExecutionRole.Arn
+  SuccessResponseFunctionV:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref SuccessResponseFunction
 
   ProxyFunction:
     Type: AWS::Serverless::Function
     Properties:
       Handler: src/api_gateway.proxy
-      Runtime: nodejs14.x
-      Architectures:
-        - x86_64
+      CodeUri: ./
+      Role: !GetAtt LambdaEdgeExecutionRole.Arn
       Events:
         Api:
           Type: Api
           Properties:
             Path: /{proxy+}
             Method: any
+            RestApiId:
+              Ref: ApiGatewayApi
+
+  ApiGatewayApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+
+  LambdaEdgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - edgelambda.amazonaws.com
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 
   CloudFrontDistribution:
     Type: AWS::CloudFront::Distribution
@@ -57,27 +126,79 @@ Resources:
       DistributionConfig:
         CacheBehaviors:
           - PathPattern: /Failure/*
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+            TargetOriginId: DefaultOrigin
+            ViewerProtocolPolicy: redirect-to-https
             LambdaFunctionAssociations:
               - EventType: viewer-request
-                LambdaFunctionARN: !GetAtt FailureFunction.FunctionArn
+                LambdaFunctionARN: !Ref FailureFunctionV
           - PathPattern: /ModHeader/*
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+            TargetOriginId: DefaultOrigin
+            ViewerProtocolPolicy: redirect-to-https
             LambdaFunctionAssociations:
               - EventType: viewer-request
-                LambdaFunctionARN: !GetAtt ModHeaderFunction.FunctionArn
+                LambdaFunctionARN: !Ref ModHeaderFunctionV
           - PathPattern: /ModBody/*
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+            TargetOriginId: DefaultOrigin
+            ViewerProtocolPolicy: redirect-to-https
             LambdaFunctionAssociations:
               - EventType: viewer-request
                 IncludeBody: true
-                LambdaFunctionARN: !GetAtt ModBodyFunction.FunctionArn
+                LambdaFunctionARN: !Ref ModBodyFunctionV
           - PathPattern: /Respond/*
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+            TargetOriginId: DefaultOrigin
+            ViewerProtocolPolicy: redirect-to-https
             LambdaFunctionAssociations:
               - EventType: viewer-request
-                LambdaFunctionARN: !GetAtt RespondFunction.FunctionArn
+                LambdaFunctionARN: !Ref RespondFunctionV
           - PathPattern: /ModUri/*
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+            TargetOriginId: DefaultOrigin
+            ViewerProtocolPolicy: redirect-to-https
             LambdaFunctionAssociations:
               - EventType: viewer-request
-                LambdaFunctionARN: !GetAtt ModUriFunction.FunctionArn
+                LambdaFunctionARN: !Ref ModUriFunctionV
         DefaultCacheBehavior:
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          TargetOriginId: DefaultOrigin
+          ViewerProtocolPolicy: redirect-to-https
           LambdaFunctionAssociations:
             - EventType: viewer-request
-              LambdaFunctionARN: !GetAtt SuccessFunction.FunctionArn
+              LambdaFunctionARN: !Ref SuccessFunctionV
+            - EventType: origin-request
+              LambdaFunctionARN: !Ref SuccessFunctionV
+            - EventType: viewer-response
+              LambdaFunctionARN: !Ref SuccessResponseFunctionV
+        Enabled: true
+        Origins:
+          - DomainName: !Sub "${ApiGatewayApi}.execute-api.us-east-1.amazonaws.com"
+            OriginPath: !Sub "/${ApiGatewayApiProdStage}"
+            Id: DefaultOrigin
+            CustomOriginConfig:
+              OriginProtocolPolicy: match-viewer
+
+#  SecondCloudFrontDistribution:
+#    Type: AWS::CloudFront::Distribution
+#    Properties:
+#      DistributionConfig:
+#        Enabled: false
+#        CacheBehaviors:
+#          - PathPattern: /*
+#            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+#            TargetOriginId: DefaultOrigin
+#            ViewerProtocolPolicy: redirect-to-https
+#        Origins:
+#          - DomainName: will-never-be-reached.org
+#            Id: DefaultOrigin
+#            CustomOriginConfig:
+#              OriginProtocolPolicy: match-viewer
+
+Outputs:
+  ApiGatewayUrl:
+    Value: !Sub "https://${ApiGatewayApi}.execute-api.us-east-1.amazonaws.com/${ApiGatewayApiProdStage}"
+  WebsiteUrl:
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
