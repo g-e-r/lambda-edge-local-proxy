@@ -5,7 +5,7 @@ exports.proxy = async (event, context) => {
   const response = {
     statusCode: 200,
     body: JSON.stringify({
-      header: "X-Key = '" + event.headers["X-Key"] + "'",
+      header: "user-agent = '" + event.headers["User-Agent"] + "'",
       body: event.body,
       path: event.path,
       message: "Served by API Gateway Proxy",

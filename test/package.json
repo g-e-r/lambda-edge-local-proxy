@@ -6,6 +6,7 @@
     "prettier": "2.6.2"
   },
   "scripts": {
-    "build": "npm run webpack"
+    "build": "npm run webpack",
+    "pretty": "npx prettier --write src"
   }
 }

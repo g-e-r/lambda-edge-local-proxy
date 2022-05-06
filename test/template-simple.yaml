@@ -1,0 +1,111 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Globals:
+  Function:
+    Runtime: nodejs14.x
+    Timeout: 5
+
+Resources:
+  FailureFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/lambda_at_edge.failure
+      CodeUri: ./
+
+  ModHeaderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/lambda_at_edge.modheader
+      CodeUri: ./
+
+  ModBodyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/lambda_at_edge.modbody
+      CodeUri: ./
+
+  RespondFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/lambda_at_edge.respond
+      CodeUri: ./
+
+  ModUriFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/lambda_at_edge.moduri
+      CodeUri: ./
+
+  SuccessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/lambda_at_edge.success
+      CodeUri: ./
+
+  SuccessResponseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/lambda_at_edge.success_response
+      CodeUri: ./
+
+  ProxyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/api_gateway.proxy
+      CodeUri: ./
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /{proxy+}
+            Method: any
+            RestApiId:
+              Ref: ApiGatewayApi
+
+  ApiGatewayApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        CacheBehaviors:
+          - PathPattern: /Failure/*
+            LambdaFunctionAssociations:
+              - EventType: viewer-request
+                LambdaFunctionARN: !GetAtt FailureFunction.FunctionArn
+          - PathPattern: /ModHeader/*
+            LambdaFunctionAssociations:
+              - EventType: viewer-request
+                LambdaFunctionARN: !GetAtt ModHeaderFunction.FunctionArn
+          - PathPattern: /ModBody/*
+            LambdaFunctionAssociations:
+              - EventType: viewer-request
+                IncludeBody: true
+                LambdaFunctionARN: !GetAtt ModBodyFunction.FunctionArn
+          - PathPattern: /Respond/*
+            LambdaFunctionAssociations:
+              - EventType: viewer-request
+                LambdaFunctionARN: !GetAtt RespondFunction.FunctionArn
+          - PathPattern: /ModUri/*
+            LambdaFunctionAssociations:
+              - EventType: viewer-request
+                LambdaFunctionARN: !GetAtt ModUriFunction.FunctionArn
+        DefaultCacheBehavior:
+          LambdaFunctionAssociations:
+            - EventType: viewer-request
+              LambdaFunctionARN: !GetAtt SuccessFunction.FunctionArn
+            - EventType: origin-request
+              LambdaFunctionARN: !GetAtt SuccessFunction.FunctionArn
+            - EventType: viewer-response
+              LambdaFunctionARN: !GetAtt SuccessResponseFunction.FunctionArn
+
+  SecondCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        CacheBehaviors:
+          - PathPattern: /*

@@ -22,7 +22,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 Emulate Lambda@Edge Viewer Request events.
-S3 and Custom Origin specific parameters not supported.
 """
 import base64
 import fnmatch
@@ -75,14 +74,25 @@ READONLY_HEADERS_VIEWER_REQUESTS = [
 ]
 
 
-def get_header_kv_capitalized(x):
-    key = "-".join(w.capitalize() for w in x[0].split("-"))
-    val = (
-        x[1][0]["value"]
-        if isinstance(x[1], list) and isinstance(x[1][0], dict) and "value" in x[1][0]
-        else ""
-    )
-    return (x[1][0]["key"] if "key" in x[1][0] else key, val)
+def get_headers_capitalized(headers_in):
+    headers_out = {}
+    for (k, v) in headers_in.items():
+        if (
+            not isinstance(v, list)
+            or len(v) == 0
+            or not isinstance(v[0], dict)
+            or not "value" in v[0]
+        ):
+            return None
+        if "key" in v[0]:
+            key = v[0]["key"]
+            if key.lower() != k.lower():
+                ctx.log.warn(f"Header key mismatch")
+                return None
+        else:
+            key = "-".join(w.capitalize() for w in k.split("-"))
+        headers_out[key] = v[0]["value"]
+    return headers_out
 
 
 class LambdaEdgeLocalProxy:
@@ -135,18 +145,18 @@ class LambdaEdgeLocalProxy:
                 data = load_yaml(text)
                 found = None
                 self.funcs = defaultdict(list)
-                resources = data["Resources"]
-                for k, v in resources.items():
+                res = data["Resources"]
+                for k, v in res.items():
                     if v["Type"] == "AWS::CloudFront::Distribution":
                         if found:
                             ctx.log.warn(
-                                f"Lambda@Edge: only first CloudFront Distribution '{found}'"
-                                + " used from the template file"
+                                f"Lambda@Edge: only first CloudFront Distribution "
+                                + "'{found}' used from the template file"
                             )
                             return
                         found = k
                         dist_config = v["Properties"]["DistributionConfig"]
-                        self.populate_from_dist_config(resources, dist_config)
+                        self.populate_from_dist_config(res, dist_config)
                 if len(self.funcs) == 0:
                     ctx.log.error(
                         "Lambda@Edge: Could not find any "
@@ -188,7 +198,9 @@ class LambdaEdgeLocalProxy:
         for func in funcs:
             event_type = func["EventType"] if "EventType" in func else ""
             include_body = func["IncludeBody"] if "IncludeBody" in func else False
-            func_arn = func["LambdaFunctionARN"] if "LambdaFunctionARN" in func else ""
+            func_arn = (
+                func["LambdaFunctionARN"] if "LambdaFunctionARN" in func else None
+            )
             if isinstance(func_arn, str):
                 func_name = func_arn.split(":")[6]
             elif "Ref" in func_arn:
@@ -196,10 +208,9 @@ class LambdaEdgeLocalProxy:
                 if func_version["Type"] != "AWS::Lambda::Version":
                     ctx.log.error(f"Lambda@Edge: not a Lambda Version reference")
                     continue
-                props = (
-                    func_version["Properties"] if "Properties" in func_version else {}
+                func_name = self.resolve_ref(
+                    res, func_version["Properties"]["FunctionName"]
                 )
-                func_name = self.resolve_ref(res, props["FunctionName"])
             elif "Fn::GetAtt" in func_arn:
                 if func_arn["Fn::GetAtt"][1] == "FunctionArn":
                     func_name = func_arn["Fn::GetAtt"][0]
@@ -241,35 +252,47 @@ class LambdaEdgeLocalProxy:
         """Translate lambda@edge headers to mitmproxy headers"""
         if not "headers" in payload:
             return
-        headers = dict(get_header_kv_capitalized(x) for x in payload["headers"].items())
+        headers = get_headers_capitalized(payload["headers"])
+        if not headers:
+            msg = f"Lambda@Edge: malformed headers"
+            ctx.log.warn(msg)
+            flow.response = http.HTTPResponse.make(502, msg)
+            return
         for x in headers.keys():
             if x.lower() in FORBIDDEN_HEADERS:
                 msg = f"Lambda@Edge: included forbidden header '{x}' in response"
                 ctx.log.warn(msg)
                 flow.response = http.HTTPResponse.make(502, msg)
                 return
-        for x in headers.items():
-            if x[0] not in flow.request.headers:
-                if x[0].lower() in READONLY_HEADERS_VIEWER_REQUESTS:
-                    msg = f"Lambda@Edge: added read-only header '{x[0]}'"
+        for (k, v) in headers.items():
+            if k not in flow.request.headers:
+                if k.lower() in READONLY_HEADERS_VIEWER_REQUESTS:
+                    msg = f"Lambda@Edge: added read-only header '{k}'"
                     ctx.log.warn(msg)
                     flow.response = http.HTTPResponse.make(502, msg)
                     return
-                ctx.log.info(f"Lambda@Edge: *-request added header: '{x[0]}': '{x[1]}'")
-                flow.request.headers[x[0]] = x[1]
-            elif flow.request.headers[x[0]] != x[1]:
-                if x[0].lower() in READONLY_HEADERS_VIEWER_REQUESTS:
+                ctx.log.info(f"Lambda@Edge: *-request added header: '{k}': '{v}'")
+                flow.request.headers[k] = v
+            elif flow.request.headers[k] != v:
+                if k.lower() in READONLY_HEADERS_VIEWER_REQUESTS:
                     msg = (
-                        f"Lambda@Edge: modified read-only header '{x[0]}' "
-                        + "from '{flow.request.headers[x[0]]}' to '{x[1]}'"
+                        f"Lambda@Edge: modified read-only header '{k}' "
+                        + f"from '{flow.request.headers[k]}' to '{v}'"
                     )
                     ctx.log.warn(msg)
                     flow.response = http.HTTPResponse.make(502, msg)
                     return
-                ctx.log.info(
-                    f"Lambda@Edge: *-request modified header to: '{x[0]}': '{x[1]}'"
-                )
-                flow.request.headers[x[0]] = x[1]
+                ctx.log.info(f"Lambda@Edge: *-request modified header to: '{k}': '{v}'")
+                flow.request.headers[k] = v
+        for (k, v) in flow.request.headers.items():
+            if k not in headers:
+                if k.lower() in READONLY_HEADERS_VIEWER_REQUESTS:
+                    msg = f"Lambda@Edge: removed read-only header '{k}'"
+                    ctx.log.warn(msg)
+                    flow.response = http.HTTPResponse.make(502, msg)
+                    return
+                ctx.log.info(f"Lambda@Edge: *-request removed header: '{k}'")
+                del flow.request.headers[k]
 
     def get_method(self, flow):
         """Get HTTP method from mitmproxy"""
@@ -351,7 +374,12 @@ class LambdaEdgeLocalProxy:
             content = str(base64.b64decode(content), "utf-8")
         headers = payload["headers"] if "headers" in payload else {}
         # TODO not sure which headers are read-only in this situation
-        headers = dict(get_header_kv_capitalized(x) for x in headers.items())
+        headers = get_headers_capitalized(headers)
+        if not headers:
+            msg = f"Lambda@Edge: malformed headers"
+            ctx.log.warn(msg)
+            flow.response = http.HTTPResponse.make(502, msg)
+            return
         for x in headers.keys():
             if x.lower() in FORBIDDEN_HEADERS:
                 msg = f"Lambda@Edge: adding forbidden header '{x}'"
@@ -446,6 +474,11 @@ class LambdaEdgeLocalProxy:
                 msg = (
                     f"Lambda@Edge FunctionError: '{res['FunctionError']}'\n'{payload}'"
                 )
+                ctx.log.warn(msg)
+                flow.response = http.HTTPResponse.make(503, msg)
+                return
+            if not isinstance(payload, dict):
+                msg = f"Lambda@Edge: malformed payload '{payload}'"
                 ctx.log.warn(msg)
                 flow.response = http.HTTPResponse.make(502, msg)
                 return

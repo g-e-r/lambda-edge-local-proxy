@@ -10,8 +10,8 @@ exports.failure = async (event, context, callback) => {
   const request = event.Records[0].cf.request;
   const params = querystring.parse(request.querystring);
   if ("p" in params) {
-    if (params["p"] === "MALFORMED_RETURN") {
-      callback(null, { mal: "formed" });
+    if (params["p"] === "EMPTY_RETURN") {
+      callback(null, {});
     } else if (params["p"] === "TIMEOUT") {
       while (true) {
         await sleep(5 * 1000);
@@ -19,6 +19,8 @@ exports.failure = async (event, context, callback) => {
       }
     } else if (params["p"] === "HEADER_NO_VALUE") {
       callback(null, { headers: { "no-value": [{ VaLuE: "wrong" }] } });
+    } else if (params["p"] === "HEADER_KV_MISMATCH") {
+      callback(null, { headers: { key1: [{ key: "key2", value: "value3" }] } });
     } else if (params["p"] === "EXCEPTION") {
       throw "Exception in Lambda @ Edge Fuction";
     }
@@ -28,15 +30,17 @@ exports.modheader = async (event, context, callback) => {
   const request = event.Records[0].cf.request;
   const params = querystring.parse(request.querystring);
   const headers = request.headers;
-  const k = "K" in params ? params["K"] : "X-KeY";
-  const v = "V" in params ? params["V"] : "X-VaLuE";
+  const k = "K" in params ? params["K"] : "user-agent";
+  const v = "V" in params ? params["V"] : "Changed_by_lambda_at_Edge";
+  headers[k] = [{ value: v }];
   if ("p" in params) {
     if (params["p"] === "KV") {
       headers[k] = [{ key: k, value: v }];
+    } else if (params["p"] === "DEL") {
+      delete headers[k];
     }
   }
-  headers[k] = [{ value: v }];
-  console.log(JSON.stringify(headers));
+  console.log(JSON.stringify(request.headers));
   callback(null, request);
 };
 exports.modbody = async (event, context, callback) => {
